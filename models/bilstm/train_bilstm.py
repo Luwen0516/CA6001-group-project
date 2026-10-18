@@ -49,17 +49,25 @@ CONFIG = {
 
     # 模型参数
     "embed_dim": 128,             # 词向量维度
-    "hidden_dim": 64,             # LSTM隐藏层维度
+    "hidden_dim": 128,            # LSTM隐藏层维度（从64调到128，模型容量更大）
     "num_layers": 2,              # LSTM层数
-    "dropout": 0.5,               # Dropout比率
+    "dropout": 0.6,               # Dropout比率（从0.5调到0.6，减轻过拟合）
 
     # 训练参数
     "batch_size": 64,
-    "epochs": 5,
+    "epochs": 15,                # 最大跑多少轮（早停会提前停）
     "lr": 0.001,
 
-    # 设备
-    "device": "mps" if torch.backends.mps.is_available() else "cpu",
+    # Early Stopping 早停机制
+    "patience": 3,              # 验证 loss 连续 3 轮不下降就停止
+
+    # 学习率调度（验证 loss 不下降时自动降低学习率）
+    "use_lr_scheduler": True,
+    "lr_factor": 0.5,            # 学习率每次减半
+    "lr_patience": 2,            # 连续 2 轮不下降就降学习率
+
+    # 设备（自动检测 CUDA / MPS / CPU）
+    "device": "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"),
 }
 
 # ============================================================
@@ -338,10 +346,19 @@ def main():
     criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.Adam(model.parameters(), lr=CONFIG["lr"])
 
+    # 学习率调度器：验证 loss 不下降时自动降低学习率
+    scheduler = None
+    if CONFIG["use_lr_scheduler"]:
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=CONFIG["lr_factor"], patience=CONFIG["lr_patience"]
+        )
+        print(f"学习率调度器已启用: factor={CONFIG['lr_factor']}, patience={CONFIG['lr_patience']}")
+
     # --- 训练 ---
     print("\n[4/5] 开始训练...")
     history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
-    best_val_acc = 0
+    best_val_loss = float("inf")    # 用验证 loss 做早停判断（比 acc 更稳定）
+    patience_counter = 0            # 早停计数器
 
     for epoch in range(CONFIG["epochs"]):
         start = time.time()
@@ -356,15 +373,30 @@ def main():
         history["train_acc"].append(train_acc)
         history["val_acc"].append(val_acc)
 
+        # 当前学习率
+        current_lr = optimizer.param_groups[0]["lr"]
+
         print(f"Epoch {epoch+1}/{CONFIG['epochs']} ({elapsed:.1f}s) | "
               f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f} | "
-              f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} F1: {val_f1:.4f}")
+              f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} F1: {val_f1:.4f} | "
+              f"LR: {current_lr:.6f}")
 
-        # 保存最佳模型
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        # 学习率调度器 step
+        if scheduler:
+            scheduler.step(val_loss)
+
+        # --- Early Stopping 逻辑 ---
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            patience_counter = 0
             torch.save(model.state_dict(), "best_model.pt")
-            print(f"  -> 新最佳模型! Val Acc: {val_acc:.4f}")
+            print(f"  -> 新最佳模型! Val Loss: {val_loss:.4f}")
+        else:
+            patience_counter += 1
+            print(f"  -> 验证 loss 未下降 ({patience_counter}/{CONFIG['patience']})")
+            if patience_counter >= CONFIG["patience"]:
+                print(f"\n早停触发! 连续 {CONFIG['patience']} 轮验证 loss 未下降，停止训练。")
+                break
 
     # --- 测试集评估 ---
     print("\n[5/5] 测试集评估...")
